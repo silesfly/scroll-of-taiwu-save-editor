@@ -1,0 +1,8 @@
+node_modules/
+__pycache__/
+*.pyc
+*.exe
+*.pdb
+dist/ScrollOfTaiwuSaveEditor-*.html
+.playwright-mcp/
+.DS_Store
