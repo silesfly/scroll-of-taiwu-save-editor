@@ -66,6 +66,8 @@ namespace TaiwuEditor
         // ===== Win32 =====
         private const uint GENERIC_READ = 0x80000000u;
         private const uint GENERIC_WRITE = 0x40000000u;
+        private const uint DELETE_ACCESS = 0x00010000u;
+        private const uint FILE_SHARE_NONE = 0u;
         private const uint FILE_SHARE_READ = 0x00000001u;
         private const uint FILE_SHARE_WRITE = 0x00000002u;
         private const uint FILE_SHARE_DELETE = 0x00000004u;
@@ -352,6 +354,89 @@ namespace TaiwuEditor
             }
         }
 
+        private static bool RenameByHandle(IntPtr h, string destPath, bool replaceIfExists)
+        {
+            if (h == IntPtr.Zero || h == new IntPtr(-1) || string.IsNullOrEmpty(destPath)) return false;
+            byte[] nameBytes = Encoding.Unicode.GetBytes(destPath);
+            int headerSize = IntPtr.Size * 2 + 4;
+            int totalSize = headerSize + nameBytes.Length + 2;
+            IntPtr buf = Marshal.AllocHGlobal(totalSize);
+            try
+            {
+                byte[] zeros = new byte[totalSize];
+                Marshal.Copy(zeros, 0, buf, totalSize);
+                Marshal.WriteByte(buf, 0, replaceIfExists ? (byte)1 : (byte)0);
+                Marshal.WriteIntPtr(buf, IntPtr.Size, IntPtr.Zero);
+                Marshal.WriteInt32(buf, IntPtr.Size * 2, nameBytes.Length);
+                Marshal.Copy(nameBytes, 0, new IntPtr(buf.ToInt64() + headerSize), nameBytes.Length);
+                return SetFileInformationByHandle(h, FileRenameInfoClass, buf, (uint)totalSize);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buf);
+            }
+        }
+
+        private static bool DeleteByHandle(IntPtr h)
+        {
+            if (h == IntPtr.Zero || h == new IntPtr(-1)) return false;
+            IntPtr buf = Marshal.AllocHGlobal(1);
+            try
+            {
+                Marshal.WriteByte(buf, 0, 1);
+                return SetFileInformationByHandle(h, FileDispositionInfoClass, buf, 1u);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buf);
+            }
+        }
+
+        private static bool PinAncestorDirectories(string canonDir, string canonicalRoot,
+            HashSet<string> pinnedDirs, List<IntPtr> pinnedHandles, out string error)
+        {
+            error = null;
+            string stop = canonicalRoot.TrimEnd('\\', '/');
+            string cur = canonDir.TrimEnd('\\', '/');
+            while (!string.IsNullOrEmpty(cur))
+            {
+                if (pinnedDirs.Add(cur))
+                {
+                    // Omit FILE_SHARE_DELETE so no ancestor up to canonicalRoot can be renamed or swapped with a junction.
+                    IntPtr dirH = CreateFileW(cur, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+                    if (dirH == new IntPtr(-1) || dirH == IntPtr.Zero)
+                    {
+                        error = "상위 디렉터리 핸들 열기 실패: " + cur;
+                        return false;
+                    }
+                    pinnedHandles.Add(dirH);
+                    BY_HANDLE_FILE_INFORMATION dinfo;
+                    if (!GetFileInformationByHandle(dirH, out dinfo) ||
+                        (dinfo.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+                        (dinfo.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+                    {
+                        error = "상위 디렉터리가 재해석 지점이거나 유효하지 않습니다: " + cur;
+                        return false;
+                    }
+                    string finalDir = GetFinalPath(dirH);
+                    string fpDir = string.IsNullOrEmpty(finalDir) ? "" : finalDir.TrimEnd('\\', '/');
+                    if (string.IsNullOrEmpty(fpDir) || fpDir.StartsWith(@"\\", StringComparison.Ordinal) ||
+                        (!string.Equals(fpDir, stop, StringComparison.OrdinalIgnoreCase) && !IsPathInsideRoot(fpDir, stop)))
+                    {
+                        error = "상위 디렉터리 최종 경로가 루트를 벗어납니다: " + cur;
+                        return false;
+                    }
+                }
+                if (string.Equals(cur, stop, StringComparison.OrdinalIgnoreCase)) break;
+                DirectoryInfo parent = null;
+                try { parent = Directory.GetParent(cur); } catch { break; }
+                if (parent == null) break;
+                cur = parent.FullName.TrimEnd('\\', '/');
+            }
+            return true;
+        }
+
         // ===== Atomic batch commit =====
         public static CommitResult CommitBatch(BatchItem[] items, string rootDir, string timestampTag)
         {
@@ -371,14 +456,18 @@ namespace TaiwuEditor
             if (string.IsNullOrEmpty(timestampTag)) timestampTag = DateTime.UtcNow.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture);
             string canonicalTag = timestampTag.Replace("\\", "_").Replace("/", "_").Replace(":", "_");
 
-            List<string> touchedTemps = new List<string>();
-            List<string> createdBackups = new List<string>();
-            List<string> renamedTargets = new List<string>();
+            List<IntPtr> touchedTempHandles = new List<IntPtr>();
+            List<IntPtr> backedUpHandles = new List<IntPtr>();
+            List<string> backedUpOrigPaths = new List<string>();
+            List<IntPtr> renamedTempHandles = new List<IntPtr>();
             List<IntPtr> pinnedHandles = new List<IntPtr>();
             HashSet<string> pinnedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            List<IntPtr> itemLockHandles = new List<IntPtr>();
+            List<string> finalPaths = new List<string>();
+            List<IntPtr> tempHandles = new List<IntPtr>();
             try
             {
-                // Phase 1: pin parent dirs + open/lock existing targets (no FILE_SHARE_WRITE) before TOCTOU window
+                // Phase 1: pin ancestor dirs (no FILE_SHARE_DELETE) + lock existing targets (FILE_SHARE_NONE)
                 foreach (BatchItem it in items)
                 {
                     if (it == null || string.IsNullOrEmpty(it.Path) || it.Data == null)
@@ -393,30 +482,17 @@ namespace TaiwuEditor
                     string canonDir = Path.GetDirectoryName(canon);
                     if (string.IsNullOrEmpty(canonDir) || !Directory.Exists(canonDir))
                         return new CommitResult(false, "상위 디렉터리 경로가 루트를 벗어납니다: " + it.Path, backups);
-                    if (pinnedDirs.Add(canonDir))
-                    {
-                        IntPtr dirH = CreateFileW(canonDir, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                            IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
-                        if (dirH == new IntPtr(-1) || dirH == IntPtr.Zero)
-                            return new CommitResult(false, "상위 디렉터리 핸들 열기 실패: " + canonDir, backups);
-                        pinnedHandles.Add(dirH);
-                        BY_HANDLE_FILE_INFORMATION dinfo;
-                        if (!GetFileInformationByHandle(dirH, out dinfo) ||
-                            (dinfo.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
-                            (dinfo.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
-                            return new CommitResult(false, "상위 디렉터리가 재해석 지점이거나 유효하지 않습니다: " + canonDir, backups);
-                        string finalDir = GetFinalPath(dirH);
-                        string fpDir = string.IsNullOrEmpty(finalDir) ? "" : finalDir.TrimEnd('\\', '/');
-                        if (string.IsNullOrEmpty(fpDir) || fpDir.StartsWith(@"\\", StringComparison.Ordinal) ||
-                            (!string.Equals(fpDir, canonicalRoot.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase) && !IsPathInsideRoot(fpDir, canonicalRoot)))
-                            return new CommitResult(false, "상위 디렉터리 최종 경로가 루트를 벗어납니다: " + canonDir, backups);
-                    }
+                    string pinErr;
+                    if (!PinAncestorDirectories(canonDir, canonicalRoot, pinnedDirs, pinnedHandles, out pinErr))
+                        return new CommitResult(false, pinErr, backups);
+
+                    IntPtr lockH = IntPtr.Zero;
                     if (File.Exists(canon))
                     {
-                        IntPtr lockH = CreateFileW(canon, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                        lockH = CreateFileW(canon, GENERIC_READ | DELETE_ACCESS, FILE_SHARE_NONE,
                             IntPtr.Zero, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
                         if (lockH == new IntPtr(-1) || lockH == IntPtr.Zero)
-                            return new CommitResult(false, "기존 파일 잠금 열기 실패: " + canon, backups);
+                            return new CommitResult(false, "기존 파일 배타 잠금 실패: " + canon, backups);
                         pinnedHandles.Add(lockH);
                         BY_HANDLE_FILE_INFORMATION finfo;
                         if (!VerifySingleLinkRegularFile(lockH, out finfo))
@@ -453,80 +529,74 @@ namespace TaiwuEditor
                         if (it.ExpectedHash != 0)
                             return new CommitResult(false, "신규 파일에 대한 예상 해시 불일치: " + canon, backups);
                     }
+                    itemLockHandles.Add(lockH);
+                    finalPaths.Add(canon);
                 }
 
-                // Phase 2: write temp files + verify opened temp handle inside canonicalRoot before closing
-                List<string> tempPaths = new List<string>();
-                List<string> finalPaths = new List<string>();
+                // Phase 2: create temp files exclusively via handle (FILE_SHARE_NONE + DELETE_ACCESS), keep open until Phase 3 rename
                 foreach (BatchItem it in items)
                 {
                     string canon = GetCanonicalPath(it.Path);
                     string tempPath = canon + ".new." + canonicalTag + "." + Guid.NewGuid().ToString("N").Substring(0, 8);
-                    using (FileStream fs = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                    IntPtr tempH = CreateFileW(tempPath, GENERIC_READ | GENERIC_WRITE | DELETE_ACCESS, FILE_SHARE_NONE,
+                        IntPtr.Zero, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+                    if (tempH == new IntPtr(-1) || tempH == IntPtr.Zero)
+                        throw new IOException("임시 파일 배타 생성 실패: " + tempPath);
+                    pinnedHandles.Add(tempH);
+                    touchedTempHandles.Add(tempH);
+                    string tempFinal = GetFinalPath(tempH);
+                    if (string.IsNullOrEmpty(tempFinal) || tempFinal.StartsWith(@"\\", StringComparison.Ordinal) ||
+                        !IsPathInsideRoot(tempFinal.TrimEnd('\\', '/'), canonicalRoot))
+                        throw new IOException("임시 파일 최종 경로가 루트를 벗어납니다: " + tempPath);
+                    using (SafeFileHandle tsfh = new SafeFileHandle(tempH, false))
+                    using (FileStream fs = new FileStream(tsfh, FileAccess.Write))
                     {
-                        touchedTemps.Add(tempPath);
-                        string tempFinal = GetFinalPath(fs.SafeFileHandle.DangerousGetHandle());
-                        if (string.IsNullOrEmpty(tempFinal) || tempFinal.StartsWith(@"\\", StringComparison.Ordinal) ||
-                            !IsPathInsideRoot(tempFinal.TrimEnd('\\', '/'), canonicalRoot))
-                            throw new IOException("임시 파일 최종 경로가 루트를 벗어납니다: " + tempPath);
                         fs.Write(it.Data, 0, it.Data.Length);
-                        fs.Flush(true);
+                        fs.Flush();
                     }
-                    tempPaths.Add(tempPath);
-                    finalPaths.Add(canon);
+                    FlushFileBuffers(tempH);
+                    tempHandles.Add(tempH);
                 }
 
-                // Phase 3: rename existing -> backup, then temp -> final
+                // Phase 3: rename strictly by handle via SetFileInformationByHandle(FileRenameInfo) while all locks remain held
                 for (int i = 0; i < finalPaths.Count; i++)
                 {
                     string finalPath = finalPaths[i];
-                    string tempPath = tempPaths[i];
-                    if (File.Exists(finalPath))
+                    IntPtr lockH = itemLockHandles[i];
+                    IntPtr tempH = tempHandles[i];
+                    if (lockH != IntPtr.Zero)
                     {
-                        string backupPath = finalPath + ".bak." + canonicalTag;
-                        if (!MoveFileExW(finalPath, backupPath, 0))
-                        {
-                            throw new IOException("백업 이동 실패: " + finalPath);
-                        }
-                        createdBackups.Add(backupPath);
+                        string backupPath = finalPath + ".bak." + canonicalTag + "." + Guid.NewGuid().ToString("N").Substring(0, 6);
+                        if (!RenameByHandle(lockH, backupPath, false))
+                            throw new IOException("백업 핸들 이동 실패: " + finalPath);
+                        backedUpHandles.Add(lockH);
+                        backedUpOrigPaths.Add(finalPath);
                         backups.Add(backupPath);
                     }
-                    if (!MoveFileExW(tempPath, finalPath, 0))
-                    {
-                        throw new IOException("최종 이동 실패: " + tempPath);
-                    }
-                    touchedTemps.Remove(tempPath);
-                    renamedTargets.Add(finalPath);
+                    if (!RenameByHandle(tempH, finalPath, false))
+                        throw new IOException("최종 핸들 이동 실패: " + finalPath);
+                    touchedTempHandles.Remove(tempH);
+                    renamedTempHandles.Add(tempH);
                 }
 
                 return new CommitResult(true, null, backups);
             }
             catch (Exception ex)
             {
-                // Rollback: remove any newly-renamed targets, restore backups
+                // Rollback strictly by open handles before releasing locks
                 try
                 {
-                    foreach (string t in renamedTargets)
+                    for (int i = renamedTempHandles.Count - 1; i >= 0; i--)
                     {
-                        try { if (File.Exists(t)) File.Delete(t); }
-                        catch { }
+                        try { DeleteByHandle(renamedTempHandles[i]); } catch { }
                     }
-                    for (int i = createdBackups.Count - 1; i >= 0; i--)
+                    for (int i = backedUpHandles.Count - 1; i >= 0; i--)
                     {
-                        string bk = createdBackups[i];
-                        // restore to path without .bak.<tag>
-                        int idx = bk.LastIndexOf(".bak.", StringComparison.Ordinal);
-                        if (idx > 0)
-                        {
-                            string orig = bk.Substring(0, idx);
-                            try { if (File.Exists(bk)) MoveFileExW(bk, orig, 0); }
-                            catch { }
-                        }
+                        try { RenameByHandle(backedUpHandles[i], backedUpOrigPaths[i], false); } catch { }
                     }
-                    foreach (string t in touchedTemps)
+                    for (int i = touchedTempHandles.Count - 1; i >= 0; i--)
                     {
-                        try { if (File.Exists(t)) File.Delete(t); }
-                        catch { }
+                        try { DeleteByHandle(touchedTempHandles[i]); } catch { }
                     }
                 }
                 catch { }
