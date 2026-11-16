@@ -441,6 +441,24 @@ namespace TaiwuEditor.Tests
                             commitBatchMi.Invoke(null, new object[] { arr, temp, "colltag" });
                             Assert(File.Exists(collPath) && Encoding.ASCII.GetString(File.ReadAllBytes(collPath)) == "T1G_new",
                                 "신규 파일 CreateNew 커밋 실패");
+
+                            // Mid-Phase-3 rollback test: item #0 swaps successfully, item #1 fails RenameByHandle onto existing dir -> item #0 MUST restore intact
+                            string midA = Path.Combine(temp, "mid_a.sav");
+                            File.WriteAllText(midA, "ORIG-MID-A");
+                            var crcMi = t.GetMethod("Crc32", new Type[] { typeof(byte[]) });
+                            uint crcA = (crcMi != null) ? (uint)crcMi.Invoke(null, new object[] { File.ReadAllBytes(midA) }) : 0u;
+                            string blockDir = Path.Combine(temp, "mid_block_dir.sav");
+                            Directory.CreateDirectory(blockDir);
+                            Array midArr = Array.CreateInstance(batchType, 2);
+                            midArr.SetValue(Activator.CreateInstance(batchType, new object[] { midA, crcA, Encoding.ASCII.GetBytes("NEW-MID-A") }), 0);
+                            midArr.SetValue(Activator.CreateInstance(batchType, new object[] { blockDir, 0u, Encoding.ASCII.GetBytes("NEW-DIR") }), 1);
+                            object midRes = commitBatchMi.Invoke(null, new object[] { midArr, temp, "midfail" });
+                            var okProp = midRes != null ? midRes.GetType().GetProperty("Success") : null;
+                            Assert(okProp != null && !(bool)okProp.GetValue(midRes, null), "중간 Phase 3 실패 시 Success=false여야 합니다.");
+                            Assert(File.Exists(midA) && File.ReadAllText(midA) == "ORIG-MID-A",
+                                "Phase 3 롤백 후 원본 파일이 복원되지 않았습니다.");
+                            Assert(Directory.GetFiles(temp, "mid*.new.*").Length == 0,
+                                "롤백 후 mid 임시 파일이 남아 있습니다.");
                         }
                         Assert(File.ReadAllText(sentinel) == "KEEP-SENTINEL",
                             "사전 존재 임시 경로가 손상되었습니다.");

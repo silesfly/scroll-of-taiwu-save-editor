@@ -460,6 +460,7 @@ namespace TaiwuEditor
             List<IntPtr> backedUpHandles = new List<IntPtr>();
             List<string> backedUpOrigPaths = new List<string>();
             List<IntPtr> renamedTempHandles = new List<IntPtr>();
+            List<string> renamedDestPaths = new List<string>();
             List<IntPtr> pinnedHandles = new List<IntPtr>();
             HashSet<string> pinnedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             List<IntPtr> itemLockHandles = new List<IntPtr>();
@@ -577,30 +578,58 @@ namespace TaiwuEditor
                         throw new IOException("최종 핸들 이동 실패: " + finalPath);
                     touchedTempHandles.Remove(tempH);
                     renamedTempHandles.Add(tempH);
+                    renamedDestPaths.Add(finalPath);
                 }
 
                 return new CommitResult(true, null, backups);
             }
             catch (Exception ex)
             {
-                // Rollback strictly by open handles before releasing locks
+                List<string> rollbackErrors = new List<string>();
+                // Rollback: unlink renamed temp entries and close handles BEFORE restoring backups to free destination paths
                 try
                 {
                     for (int i = renamedTempHandles.Count - 1; i >= 0; i--)
                     {
-                        try { DeleteByHandle(renamedTempHandles[i]); } catch { }
+                        IntPtr th = renamedTempHandles[i];
+                        if (th == IntPtr.Zero || th == new IntPtr(-1)) continue;
+                        string destP = (i < renamedDestPaths.Count) ? renamedDestPaths[i] : "";
+                        bool unlinked = false;
+                        try { unlinked = DeleteByHandle(th); } catch { }
+                        if (!unlinked && !string.IsNullOrEmpty(destP))
+                        {
+                            try
+                            {
+                                string delPath = destP + ".rbdel." + Guid.NewGuid().ToString("N").Substring(0, 6);
+                                if (RenameByHandle(th, delPath, false)) unlinked = DeleteByHandle(th);
+                            }
+                            catch { }
+                        }
+                        if (!unlinked) rollbackErrors.Add("임시 교체 해제 실패: " + destP);
+                        pinnedHandles.Remove(th);
+                        try { CloseHandle(th); } catch { }
                     }
                     for (int i = backedUpHandles.Count - 1; i >= 0; i--)
                     {
-                        try { RenameByHandle(backedUpHandles[i], backedUpOrigPaths[i], false); } catch { }
+                        IntPtr bh = backedUpHandles[i];
+                        string orig = backedUpOrigPaths[i];
+                        bool restored = false;
+                        try { restored = RenameByHandle(bh, orig, false); } catch { }
+                        if (!restored) rollbackErrors.Add("백업 복원 실패: " + orig);
                     }
                     for (int i = touchedTempHandles.Count - 1; i >= 0; i--)
                     {
-                        try { DeleteByHandle(touchedTempHandles[i]); } catch { }
+                        IntPtr uh = touchedTempHandles[i];
+                        if (uh == IntPtr.Zero || uh == new IntPtr(-1)) continue;
+                        try { DeleteByHandle(uh); } catch { }
+                        pinnedHandles.Remove(uh);
+                        try { CloseHandle(uh); } catch { }
                     }
                 }
-                catch { }
-                return new CommitResult(false, "커밋 실패: " + ex.Message, backups);
+                catch (Exception rbEx) { rollbackErrors.Add(rbEx.Message); }
+                string msg = "커밋 실패: " + ex.Message;
+                if (rollbackErrors.Count > 0) msg += " | 롤백 오류: " + string.Join("; ", rollbackErrors.ToArray());
+                return new CommitResult(false, msg, backups);
             }
             finally
             {
