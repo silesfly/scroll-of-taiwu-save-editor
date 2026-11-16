@@ -68,6 +68,7 @@ namespace TaiwuEditor
         private const uint GENERIC_WRITE = 0x40000000u;
         private const uint FILE_SHARE_READ = 0x00000001u;
         private const uint FILE_SHARE_WRITE = 0x00000002u;
+        private const uint FILE_SHARE_DELETE = 0x00000004u;
         private const uint OPEN_EXISTING = 3u;
         private const uint CREATE_NEW = 1u;
         private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080u;
@@ -373,9 +374,11 @@ namespace TaiwuEditor
             List<string> touchedTemps = new List<string>();
             List<string> createdBackups = new List<string>();
             List<string> renamedTargets = new List<string>();
+            List<IntPtr> pinnedHandles = new List<IntPtr>();
+            HashSet<string> pinnedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             try
             {
-                // Phase 1: precondition checks
+                // Phase 1: pin parent dirs + open/lock existing targets (no FILE_SHARE_WRITE) before TOCTOU window
                 foreach (BatchItem it in items)
                 {
                     if (it == null || string.IsNullOrEmpty(it.Path) || it.Data == null)
@@ -388,18 +391,61 @@ namespace TaiwuEditor
                     if (HasReparseAncestor(canon, canonicalRoot))
                         return new CommitResult(false, "상위 디렉터리에 재해석 지점이 허용되지 않습니다: " + it.Path, backups);
                     string canonDir = Path.GetDirectoryName(canon);
-                    if (string.IsNullOrEmpty(canonDir) || !Directory.Exists(canonDir) || !VerifyFinalPathInsideRoot(canonDir, canonicalRoot, true))
+                    if (string.IsNullOrEmpty(canonDir) || !Directory.Exists(canonDir))
                         return new CommitResult(false, "상위 디렉터리 경로가 루트를 벗어납니다: " + it.Path, backups);
+                    if (pinnedDirs.Add(canonDir))
+                    {
+                        IntPtr dirH = CreateFileW(canonDir, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+                        if (dirH == new IntPtr(-1) || dirH == IntPtr.Zero)
+                            return new CommitResult(false, "상위 디렉터리 핸들 열기 실패: " + canonDir, backups);
+                        pinnedHandles.Add(dirH);
+                        BY_HANDLE_FILE_INFORMATION dinfo;
+                        if (!GetFileInformationByHandle(dirH, out dinfo) ||
+                            (dinfo.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+                            (dinfo.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+                            return new CommitResult(false, "상위 디렉터리가 재해석 지점이거나 유효하지 않습니다: " + canonDir, backups);
+                        string finalDir = GetFinalPath(dirH);
+                        string fpDir = string.IsNullOrEmpty(finalDir) ? "" : finalDir.TrimEnd('\\', '/');
+                        if (string.IsNullOrEmpty(fpDir) || fpDir.StartsWith(@"\\", StringComparison.Ordinal) ||
+                            (!string.Equals(fpDir, canonicalRoot.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase) && !IsPathInsideRoot(fpDir, canonicalRoot)))
+                            return new CommitResult(false, "상위 디렉터리 최종 경로가 루트를 벗어납니다: " + canonDir, backups);
+                    }
                     if (File.Exists(canon))
                     {
-                        if (!VerifyFinalPathInsideRoot(canon, canonicalRoot, false))
+                        IntPtr lockH = CreateFileW(canon, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                            IntPtr.Zero, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+                        if (lockH == new IntPtr(-1) || lockH == IntPtr.Zero)
+                            return new CommitResult(false, "기존 파일 잠금 열기 실패: " + canon, backups);
+                        pinnedHandles.Add(lockH);
+                        BY_HANDLE_FILE_INFORMATION finfo;
+                        if (!VerifySingleLinkRegularFile(lockH, out finfo))
+                            return new CommitResult(false, "기존 파일이 재해석 지점이거나 다중 링크입니다: " + canon, backups);
+                        string finalFile = GetFinalPath(lockH);
+                        if (string.IsNullOrEmpty(finalFile) || finalFile.StartsWith(@"\\", StringComparison.Ordinal) ||
+                            !IsPathInsideRoot(finalFile.TrimEnd('\\', '/'), canonicalRoot))
                             return new CommitResult(false, "최종 파일 경로가 루트를 벗어납니다: " + canon, backups);
-                        string err;
-                        byte[] cur = SafeReadAllBytes(canon, out err);
-                        if (cur == null)
-                            return new CommitResult(false, "기존 파일 검증 실패: " + err, backups);
-                        uint h = Crc32(cur);
-                        if (h != it.ExpectedHash)
+                        long sz = ((long)finfo.FileSizeHigh << 32) | (long)finfo.FileSizeLow;
+                        if (sz > MaxSaveBytes)
+                            return new CommitResult(false, "기존 파일 크기가 허용 한도를 초과합니다: " + canon, backups);
+                        byte[] cur = new byte[(int)sz];
+                        if (sz > 0)
+                        {
+                            using (SafeFileHandle sfh = new SafeFileHandle(lockH, false))
+                            using (FileStream rfs = new FileStream(sfh, FileAccess.Read))
+                            {
+                                int read = 0;
+                                while (read < cur.Length)
+                                {
+                                    int n = rfs.Read(cur, read, cur.Length - read);
+                                    if (n <= 0) break;
+                                    read += n;
+                                }
+                                if (read != cur.Length)
+                                    return new CommitResult(false, "기존 파일 읽기 실패: " + canon, backups);
+                            }
+                        }
+                        if (Crc32(cur) != it.ExpectedHash)
                             return new CommitResult(false, "해시 불일치(동시 변경 감지): " + canon, backups);
                     }
                     else
@@ -409,7 +455,7 @@ namespace TaiwuEditor
                     }
                 }
 
-                // Phase 2: write temp files + backups (CreateNew prevents pre-planted hardlink/symlink truncation)
+                // Phase 2: write temp files + verify opened temp handle inside canonicalRoot before closing
                 List<string> tempPaths = new List<string>();
                 List<string> finalPaths = new List<string>();
                 foreach (BatchItem it in items)
@@ -419,6 +465,10 @@ namespace TaiwuEditor
                     using (FileStream fs = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
                     {
                         touchedTemps.Add(tempPath);
+                        string tempFinal = GetFinalPath(fs.SafeFileHandle.DangerousGetHandle());
+                        if (string.IsNullOrEmpty(tempFinal) || tempFinal.StartsWith(@"\\", StringComparison.Ordinal) ||
+                            !IsPathInsideRoot(tempFinal.TrimEnd('\\', '/'), canonicalRoot))
+                            throw new IOException("임시 파일 최종 경로가 루트를 벗어납니다: " + tempPath);
                         fs.Write(it.Data, 0, it.Data.Length);
                         fs.Flush(true);
                     }
@@ -481,6 +531,17 @@ namespace TaiwuEditor
                 }
                 catch { }
                 return new CommitResult(false, "커밋 실패: " + ex.Message, backups);
+            }
+            finally
+            {
+                for (int i = 0; i < pinnedHandles.Count; i++)
+                {
+                    IntPtr ph = pinnedHandles[i];
+                    if (ph != IntPtr.Zero && ph != new IntPtr(-1))
+                    {
+                        try { CloseHandle(ph); } catch { }
+                    }
+                }
             }
         }
 
