@@ -8,7 +8,7 @@
 - **작업 플로우 규칙 (REA 선행 조사)**: 게임 에디터 작성 시 먼저 `무협위키`에 REA 분석 결과가 있으면 재사용하고, 없으면 `REA`로 게임 바이너리/소스 구조 분석부터 수행한다(`projects/game-editor.md` 반영).
 
 ## 본 작업 AGY 영수증 (`Conversation ID: 0fa1bd71-7c87-4333-85db-5ed9afdd50ff`)
-- **Review Gate 영수증 (`#5 review_gate`)**: `gemini-4-carbon-medium` (`silesfly_credit`, response_id `F3z6au3qPP6Mx9gP1dfsoQM`) — `VERDICT: APPROVE`, `CHANGE_REVIEW: PASS`, `INTEGRATION_GATE: PASS`
+- **Review Gate 영수증 (`#5 review_gate`)**: `gpt-6.1-sol` (비작성자 `openai` 계열, 커밋 `4a83a59`) — `VERDICT: APPROVE`, `CHANGE_REVIEW: PASS`, `INTEGRATION_GATE: PASS` (선행 `gemini-4-carbon-medium` `F3z6au3qPP6Mx9gP1dfsoQM` `APPROVE`)
 - **Duplication Guard 스냅샷**: `~/.codex/state/duplication-guard/taiwu-20261116-before.json` -> `taiwu-20261116-after.json`
 - **Laya Routing (`--harness agy`, `decision_id: taiwu-20261116-001`)**: `R2` (`code_implementer`) `outcome` / `label` 완료.
 

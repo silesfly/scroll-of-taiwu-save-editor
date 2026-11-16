@@ -2,7 +2,7 @@
 
 - **프로젝트 루트**: `/home/jiyoung/workspace/editors/태오회권_에디터`
 - **작성 시각**: 2026-11-16
-- **기준 브랜치**: `main`
+- **기준 브랜치**: `main` (HEAD `4a83a59` — 초기 커밋 `d102a81`, `SaveStore.cs` 보안 강화 `fd05d94`/`4a83a59`)
 
 ## 완료된 구현 요약
 1. **REA / ECMA-335 메타데이터 기반 `ArchiveData` v4 코덱 (`src/taiwu-deflate.js`, `src/taiwu-wire.js`, `src/taiwu-codec.js`)**
@@ -18,7 +18,8 @@
 4. **Python CLI & HTTP 루프백 서버 (`taiwu_editor.py`)**
    - `demo`, `validate`, `inspect`, `presets`, `edit`, `serve` 및 경로 탈출 차단(`403`), `Origin` 검사(`403`), 백업 생성 검증.
 5. **Windows `.NET 4.8` WebView2 호스트 (`src/SaveStore.cs`, `src/SaveEditor.cs`, `tests/SaveStoreTests.cs`)**
-   - `SaveEditor.cs` 네임스페이스(`using TaiwuEditor;`) 및 `SaveEditor.Invoke` 한정 수정 후 0-에러 컴파일 확인.
+   - `SaveEditor.cs` 네임스페이스(`using TaiwuEditor;`) 및 `SaveEditor.Invoke` 한정 수정 후 0-에러·0-경고(`SafeFileHandle`) 컴파일 확인.
+   - `SaveStore.cs`: 상위 디렉터리 `HasReparseAncestor`·`VerifyFinalPathInsideRoot`·`\\?\UNC\` 선행 처리 및 `CommitBatch` `FileMode.CreateNew` + GUID 임시 파일 배타 생성 적용 (`4a83a59`).
 
 ## 검증 영수증 (최종 수정 이후 실행)
 - `python3 tools/extract_catalog.py --check-only`: **PASS** (`Check passed successfully. Verified 14 categories.`)
@@ -28,7 +29,7 @@
 - Playwright 헤드리스 E2E (`http://127.0.0.1:18485/`): **PASS** (`beforeDirty="변경 없음"`, 6개 탭 정상 렌더, `hero_max_stats` 적용 후 `dirtyAfterPreset="변경 1건"` / `54` diff 행, `[object Object]` 없음, `hanziCount=0`, 콘솔 오류 `0`건 / 경고 `0`건)
 - Windows-5090 `.NET 4.8` 검증: `SaveStoreTests.exe` **통과 5 / 실패 0**, `ScrollOfTaiwuSaveEditor.exe --self-test` **exit 0**
 - Duplication Guard (`duplicate_guard.py check --target src --target tests --target tools`): 테스트 파일(`tests/SaveStoreTests.cs`, `tests/test_cli_and_server.py`) 보일러플레이트 및 대칭 reader/writer 블록(`taiwu-codec.js`, `taiwu-wire.js`) 14건 확인, 실제 중복 결함 없음.
-- `#5 review_gate` (`gemini-4-carbon-medium` via `silesfly_credit`, `F3z6au3qPP6Mx9gP1dfsoQM`): **VERDICT: APPROVE / CHANGE_REVIEW: PASS / INTEGRATION_GATE: PASS** (`P0`/`P1` 없음).
+- `#5 review_gate` (`gpt-6.1-sol` 비작성자 `openai` 계열, 커밋 `4a83a59`): **VERDICT: APPROVE / CHANGE_REVIEW: PASS / INTEGRATION_GATE: PASS** (`SaveStore.cs` P1 `FileMode.CreateNew` 수정 반영 확인). 선행 `gemini-4-carbon-medium`(`silesfly_credit`, `F3z6au3qPP6Mx9gP1dfsoQM`)도 **VERDICT: APPROVE**.
 
 ## NOT_RUN / 잔여 확인 사항
 - Steam 실게임 클라이언트(`The Scroll Of Taiwu`, AppID `838350`)에서 실제 `.sav` 파일 로드 후 게임 재실행 통합 테스트: **NOT_RUN** (실게임 바이너리 메타데이터·CRC32 스펙 검증 및 데모/리소스 픽스처 라운드트립까지 완료).
