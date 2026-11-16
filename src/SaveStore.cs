@@ -5,6 +5,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 
 namespace TaiwuEditor
 {
@@ -239,7 +240,10 @@ namespace TaiwuEditor
                 byte[] buf = new byte[(int)size];
                 if (size > 0)
                 {
-                    using (FileStream fs = new FileStream(h, FileAccess.Read))
+                    IntPtr owned = h;
+                    h = IntPtr.Zero;
+                    using (SafeFileHandle sfh = new SafeFileHandle(owned, true))
+                    using (FileStream fs = new FileStream(sfh, FileAccess.Read))
                     {
                         int read = 0;
                         while (read < buf.Length)
@@ -255,7 +259,11 @@ namespace TaiwuEditor
                         }
                     }
                 }
-                h = IntPtr.Zero; // FileStream에 양도
+                if (h != IntPtr.Zero && h != new IntPtr(-1))
+                {
+                    CloseHandle(h);
+                    h = IntPtr.Zero;
+                }
                 return buf;
             }
             catch (Exception ex)
@@ -291,9 +299,54 @@ namespace TaiwuEditor
                 if (n == 0) return null;
             }
             string s = sb.ToString();
-            if (s.StartsWith(@"\\?\", StringComparison.Ordinal)) s = s.Substring(4);
             if (s.StartsWith(@"\\?\UNC\", StringComparison.Ordinal)) s = @"\\" + s.Substring(8);
+            else if (s.StartsWith(@"\\?\", StringComparison.Ordinal)) s = s.Substring(4);
             return s;
+        }
+
+        private static bool HasReparseAncestor(string canonicalPath, string stopRoot)
+        {
+            if (string.IsNullOrEmpty(canonicalPath) || string.IsNullOrEmpty(stopRoot)) return false;
+            string dir;
+            try { dir = Path.GetDirectoryName(canonicalPath); }
+            catch { return true; }
+            string stop = stopRoot.TrimEnd('\\', '/');
+            while (!string.IsNullOrEmpty(dir))
+            {
+                string cur = dir.TrimEnd('\\', '/');
+                if (Directory.Exists(cur))
+                {
+                    try
+                    {
+                        if ((File.GetAttributes(cur) & FileAttributes.ReparsePoint) != 0) return true;
+                    }
+                    catch { return true; }
+                }
+                if (string.Equals(cur, stop, StringComparison.OrdinalIgnoreCase)) break;
+                DirectoryInfo parent = null;
+                try { parent = Directory.GetParent(cur); } catch { break; }
+                if (parent == null) break;
+                dir = parent.FullName;
+            }
+            return false;
+        }
+
+        private static bool VerifyFinalPathInsideRoot(string candidatePath, string canonicalRoot)
+        {
+            if (string.IsNullOrEmpty(candidatePath) || string.IsNullOrEmpty(canonicalRoot)) return false;
+            IntPtr h = CreateFileW(candidatePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                IntPtr.Zero, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
+            if (h == new IntPtr(-1) || h == IntPtr.Zero) return false;
+            try
+            {
+                string finalPath = GetFinalPath(h);
+                if (string.IsNullOrEmpty(finalPath) || finalPath.StartsWith(@"\\", StringComparison.Ordinal)) return false;
+                return IsPathInsideRoot(finalPath.TrimEnd('\\', '/'), canonicalRoot);
+            }
+            finally
+            {
+                CloseHandle(h);
+            }
         }
 
         // ===== Atomic batch commit =====
@@ -330,8 +383,12 @@ namespace TaiwuEditor
                     string canon = GetCanonicalPath(it.Path);
                     if (!IsPathInsideRoot(canon, canonicalRoot))
                         return new CommitResult(false, "경로 이탈이 감지되었습니다: " + it.Path, backups);
+                    if (HasReparseAncestor(canon, canonicalRoot))
+                        return new CommitResult(false, "상위 디렉터리에 재해석 지점이 허용되지 않습니다: " + it.Path, backups);
                     if (File.Exists(canon))
                     {
+                        if (!VerifyFinalPathInsideRoot(canon, canonicalRoot))
+                            return new CommitResult(false, "최종 파일 경로가 루트를 벗어납니다: " + canon, backups);
                         string err;
                         byte[] cur = SafeReadAllBytes(canon, out err);
                         if (cur == null)
