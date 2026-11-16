@@ -425,6 +425,27 @@ namespace TaiwuEditor.Tests
                     Assert(Encoding.ASCII.GetString(afterFail) == Encoding.ASCII.GetString(preservedGlobal),
                         "실패 후 global 내용 변경됨 (롤백 위반)");
 
+                    // Collision safety: CommitBatch uses unique CreateNew temp files and refuses existing temp collision
+                    var commitBatchMi = t.GetMethod("CommitBatch");
+                    if (commitBatchMi != null)
+                    {
+                        string collPath = Path.Combine(temp, "fresh_temp_test.sav");
+                        string sentinel = collPath + ".new.colltag";
+                        File.WriteAllText(sentinel, "KEEP-SENTINEL");
+                        var batchType = t.GetNestedType("BatchItem");
+                        if (batchType != null)
+                        {
+                            object item = Activator.CreateInstance(batchType, new object[] { collPath, 0u, Encoding.ASCII.GetBytes("T1G_new") });
+                            Array arr = Array.CreateInstance(batchType, 1);
+                            arr.SetValue(item, 0);
+                            commitBatchMi.Invoke(null, new object[] { arr, temp, "colltag" });
+                            Assert(File.Exists(collPath) && Encoding.ASCII.GetString(File.ReadAllBytes(collPath)) == "T1G_new",
+                                "신규 파일 CreateNew 커밋 실패");
+                        }
+                        Assert(File.ReadAllText(sentinel) == "KEEP-SENTINEL",
+                            "사전 존재 임시 경로가 손상되었습니다.");
+                    }
+
                     Ok(name);
                 }
                 finally

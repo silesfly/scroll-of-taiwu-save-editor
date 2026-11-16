@@ -331,7 +331,7 @@ namespace TaiwuEditor
             return false;
         }
 
-        private static bool VerifyFinalPathInsideRoot(string candidatePath, string canonicalRoot)
+        private static bool VerifyFinalPathInsideRoot(string candidatePath, string canonicalRoot, bool allowEqual)
         {
             if (string.IsNullOrEmpty(candidatePath) || string.IsNullOrEmpty(canonicalRoot)) return false;
             IntPtr h = CreateFileW(candidatePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -341,7 +341,9 @@ namespace TaiwuEditor
             {
                 string finalPath = GetFinalPath(h);
                 if (string.IsNullOrEmpty(finalPath) || finalPath.StartsWith(@"\\", StringComparison.Ordinal)) return false;
-                return IsPathInsideRoot(finalPath.TrimEnd('\\', '/'), canonicalRoot);
+                string fp = finalPath.TrimEnd('\\', '/');
+                if (allowEqual && string.Equals(fp, canonicalRoot.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase)) return true;
+                return IsPathInsideRoot(fp, canonicalRoot);
             }
             finally
             {
@@ -385,9 +387,12 @@ namespace TaiwuEditor
                         return new CommitResult(false, "경로 이탈이 감지되었습니다: " + it.Path, backups);
                     if (HasReparseAncestor(canon, canonicalRoot))
                         return new CommitResult(false, "상위 디렉터리에 재해석 지점이 허용되지 않습니다: " + it.Path, backups);
+                    string canonDir = Path.GetDirectoryName(canon);
+                    if (string.IsNullOrEmpty(canonDir) || !Directory.Exists(canonDir) || !VerifyFinalPathInsideRoot(canonDir, canonicalRoot, true))
+                        return new CommitResult(false, "상위 디렉터리 경로가 루트를 벗어납니다: " + it.Path, backups);
                     if (File.Exists(canon))
                     {
-                        if (!VerifyFinalPathInsideRoot(canon, canonicalRoot))
+                        if (!VerifyFinalPathInsideRoot(canon, canonicalRoot, false))
                             return new CommitResult(false, "최종 파일 경로가 루트를 벗어납니다: " + canon, backups);
                         string err;
                         byte[] cur = SafeReadAllBytes(canon, out err);
@@ -404,20 +409,20 @@ namespace TaiwuEditor
                     }
                 }
 
-                // Phase 2: write temp files + backups
+                // Phase 2: write temp files + backups (CreateNew prevents pre-planted hardlink/symlink truncation)
                 List<string> tempPaths = new List<string>();
                 List<string> finalPaths = new List<string>();
                 foreach (BatchItem it in items)
                 {
                     string canon = GetCanonicalPath(it.Path);
-                    string tempPath = canon + ".new." + canonicalTag;
-                    using (FileStream fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                    string tempPath = canon + ".new." + canonicalTag + "." + Guid.NewGuid().ToString("N").Substring(0, 8);
+                    using (FileStream fs = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
                     {
+                        touchedTemps.Add(tempPath);
                         fs.Write(it.Data, 0, it.Data.Length);
                         fs.Flush(true);
                     }
                     tempPaths.Add(tempPath);
-                    touchedTemps.Add(tempPath);
                     finalPaths.Add(canon);
                 }
 
