@@ -50,6 +50,26 @@
 
   function cloneJSON(x) { return JSON.parse(JSON.stringify(x)); }
 
+  function detectArchiveKind(bytes) {
+    if (!bytes) return null;
+    var data = bytes;
+    if (typeof ArrayBuffer !== 'undefined' && data instanceof ArrayBuffer) {
+      data = new Uint8Array(data);
+    } else if (
+      typeof ArrayBuffer !== 'undefined' &&
+      data.buffer instanceof ArrayBuffer &&
+      typeof data.byteLength === 'number'
+    ) {
+      data = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength);
+    }
+    if (!data || typeof data.length !== 'number' || data.length < 3) return null;
+    if (data[0] === 0x54 && data[1] === 0x31) {
+      if (data[2] === 0x47) return 'global';
+      if (data[2] === 0x4c) return 'local';
+    }
+    return null;
+  }
+
   /* ---------- 프리셋 ---------- */
   var PRESETS = {
     hero_max_stats: {
@@ -125,11 +145,37 @@
   };
 
   TaiwuEditorSession.prototype.loadBuffers = function (globalBytes, localBytes) {
-    if (!localBytes) {
-      throw new Error('지역 저장 파일이 필요합니다.');
+    if (!globalBytes && !localBytes) {
+      throw new Error('세이브 파일이 필요합니다.');
     }
-    this.localParsed = Codec.parseArchive(localBytes);
+    var globalKind = detectArchiveKind(globalBytes);
+    var localKind = detectArchiveKind(localBytes);
+
+    if (globalBytes && !localBytes) {
+      if (globalKind !== 'global') {
+        localBytes = globalBytes;
+        localKind = globalKind;
+        globalBytes = null;
+        globalKind = null;
+      }
+    } else if (!globalBytes && localBytes) {
+      if (localKind === 'global') {
+        globalBytes = localBytes;
+        globalKind = 'global';
+        localBytes = null;
+        localKind = null;
+      }
+    } else if (globalBytes && localBytes && globalKind === 'local' && localKind === 'global') {
+      var swapped = globalBytes;
+      globalBytes = localBytes;
+      localBytes = swapped;
+    }
+
+    this.localParsed = localBytes ? Codec.parseArchive(localBytes) : null;
     this.globalParsed = globalBytes ? Codec.parseArchive(globalBytes) : null;
+    if (!this.localParsed && !this.globalParsed) {
+      throw new Error('세이브 파일을 읽을 수 없습니다.');
+    }
     this.model = Codec.decodeArchiveModel(this.globalParsed, this.localParsed);
     this._ensureShape();
     this.baselineJson = JSON.stringify(this.model);
@@ -137,12 +183,75 @@
     return this;
   };
 
+  TaiwuEditorSession.prototype.attachGlobalBuffer = function (globalBytes) {
+    if (!globalBytes) {
+      throw new Error('전역 저장 파일이 필요합니다.');
+    }
+    if (detectArchiveKind(globalBytes) === 'local') {
+      return this.attachLocalBuffer(globalBytes);
+    }
+    var parsedG = Codec.parseArchive(globalBytes);
+    if (parsedG.magic !== 'T1G') {
+      throw new Error('전역 저장 파일(T1G) 형식이 아닙니다.');
+    }
+    this.globalParsed = parsedG;
+    if (this.localParsed && this.model) {
+      var decodedG = Codec.decodeArchiveModel(this.globalParsed, null);
+      this.model.global = decodedG.global || {};
+      this._ensureShape();
+      try {
+        var baseObj = JSON.parse(this.baselineJson || '{}');
+        baseObj.global = cloneJSON(this.model.global);
+        this.baselineJson = JSON.stringify(baseObj);
+      } catch (e) {
+        this.baselineJson = JSON.stringify(this.model);
+      }
+    } else {
+      this.model = Codec.decodeArchiveModel(this.globalParsed, null);
+      this._ensureShape();
+      this.baselineJson = JSON.stringify(this.model);
+      this.modifiedLog = [];
+    }
+    return this;
+  };
+
+  TaiwuEditorSession.prototype.attachLocalBuffer = function (localBytes) {
+    if (!localBytes) {
+      throw new Error('지역 저장 파일이 필요합니다.');
+    }
+    if (detectArchiveKind(localBytes) === 'global') {
+      return this.attachGlobalBuffer(localBytes);
+    }
+    var parsedL = Codec.parseArchive(localBytes);
+    if (parsedL.magic !== 'T1L') {
+      throw new Error('슬롯 저장 파일(T1L) 형식이 아닙니다.');
+    }
+    var prevGlobalModel = (this.globalParsed && this.model && this.model.global)
+      ? cloneJSON(this.model.global)
+      : null;
+    var prevGlobalBase = null;
+    if (this.globalParsed && this.baselineJson) {
+      try { prevGlobalBase = JSON.parse(this.baselineJson).global || null; } catch (e) {}
+    }
+    this.localParsed = parsedL;
+    this.model = Codec.decodeArchiveModel(this.globalParsed, this.localParsed);
+    if (prevGlobalModel) this.model.global = prevGlobalModel;
+    this._ensureShape();
+    var nextBase = cloneJSON(this.model);
+    if (prevGlobalBase) nextBase.global = prevGlobalBase;
+    this.baselineJson = JSON.stringify(nextBase);
+    this.modifiedLog = [];
+    return this;
+  };
+
   TaiwuEditorSession.prototype.exportBuffers = function () {
-    if (!this.model || !this.localParsed) {
+    if (!this.model || (!this.localParsed && !this.globalParsed)) {
       throw new Error('불러온 저장 데이터가 없습니다.');
     }
-    if (this.globalParsed) {
+    if (this.globalParsed && this.localParsed) {
       Codec.applyModelToParsed(this.globalParsed, this.localParsed, this.model);
+    } else if (this.globalParsed) {
+      Codec.applyModelToParsed(this.globalParsed, null, { global: this.model.global });
     } else {
       Codec.applyModelToParsed(
         this.localParsed,
@@ -151,7 +260,7 @@
       );
     }
     var globalSav = this.globalParsed ? Codec.serializeArchive(this.globalParsed) : null;
-    var localSav = Codec.serializeArchive(this.localParsed);
+    var localSav = this.localParsed ? Codec.serializeArchive(this.localParsed) : null;
     this.baselineJson = JSON.stringify(this.model);
     var groups = [this.model.characters, this.model.combatSkills, this.model.objectItems];
     groups.forEach(function (group) {
@@ -218,22 +327,41 @@
 
   TaiwuEditorSession.prototype.getSummary = function () {
     var m = this.model;
+    if (!m) {
+      return {
+        heroName: '없음',
+        dateText: '-',
+        currDate: 0,
+        generation: 0,
+        charCount: 0,
+        combatSkillCount: 0,
+        itemCount: 0,
+        stackableCount: 0,
+        dirtyCount: 0,
+        isDirty: false,
+        hasGlobal: !!this.globalParsed,
+        hasLocal: !!this.localParsed
+      };
+    }
     var w = m.world || {};
     var hero = this._findChar(this._heroId());
-    var heroName = hero
-      ? safeDisplayName((w.taiwuSurname || '') + (w.taiwuGivenName || ''), '이름없음')
-      : safeDisplayName((w.taiwuSurname || '') + (w.taiwuGivenName || ''), '이름없음');
+    var hasLocal = !!this.localParsed;
+    var heroName = hasLocal
+      ? safeDisplayName((w.taiwuSurname || '') + (w.taiwuGivenName || ''), hero ? this._charDisplayName(hero) : '이름없음')
+      : '전역 전용';
     return {
       heroName: heroName,
-      dateText: formatTaiwuDate(w.currDate),
+      dateText: hasLocal ? formatTaiwuDate(w.currDate) : '-',
       currDate: typeof w.currDate === 'number' ? w.currDate : 0,
-      generation: typeof w.taiwuGenerationsCount === 'number' ? w.taiwuGenerationsCount : 1,
+      generation: hasLocal ? (typeof w.taiwuGenerationsCount === 'number' ? w.taiwuGenerationsCount : 1) : 0,
       charCount: m.characters.length,
       combatSkillCount: m.combatSkills.length,
       itemCount: m.objectItems.length,
       stackableCount: m.stackableItems.length,
       dirtyCount: this._dirtyCount(),
-      isDirty: JSON.stringify(m) !== this.baselineJson
+      isDirty: JSON.stringify(m) !== this.baselineJson,
+      hasGlobal: !!this.globalParsed,
+      hasLocal: hasLocal
     };
   };
 
@@ -699,6 +827,7 @@
     PRESETS: PRESETS,
     TaiwuEditorSession: TaiwuEditorSession,
     createSession: createSession,
+    detectArchiveKind: detectArchiveKind,
     formatTaiwuDate: formatTaiwuDate,
     safeDisplayName: safeDisplayName
   };

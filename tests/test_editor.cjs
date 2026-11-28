@@ -276,6 +276,62 @@ test('exportJsonSnapshot & exportBuffers roundtrip', () => {
   eq(s2.getSummary().heroName, s.getSummary().heroName, 'heroName persisted');
 });
 
+test('single local.sav, single global.sav, swapped order, and attach preserve edits', () => {
+  const { globalSav, localSav } = Codec.createDemoSaveBundle();
+  eq(Core.detectArchiveKind(globalSav), 'global', 'detectArchiveKind T1G');
+  eq(Core.detectArchiveKind(localSav), 'local', 'detectArchiveKind T1L');
+
+  // 1) local.sav only (passed as 1st arg or 2nd arg)
+  const sLocalOnly = Core.createSession(Catalog).loadBuffers(localSav, null);
+  eq(sLocalOnly.getSummary().hasLocal, true, 'local-only hasLocal');
+  eq(sLocalOnly.getSummary().hasGlobal, false, 'local-only hasGlobal false');
+  sLocalOnly.addCharacterFeature(1, 606);
+  const outLocal = sLocalOnly.exportBuffers();
+  eq(outLocal.globalSav, null, 'local-only export has null globalSav');
+  ok(outLocal.localSav instanceof Uint8Array && outLocal.localSav.length > 0, 'local-only export localSav valid');
+  const reloadLocal = Core.createSession(Catalog).loadBuffers(null, outLocal.localSav);
+  ok(reloadLocal.getCharacterDetail(1).featureIds.includes(606), 'added feature #606 persisted in local-only roundtrip');
+
+  // 2) global.sav only
+  const sGlobalOnly = Core.createSession(Catalog).loadBuffers(globalSav, null);
+  eq(sGlobalOnly.getSummary().hasLocal, false, 'global-only hasLocal false');
+  eq(sGlobalOnly.getSummary().hasGlobal, true, 'global-only hasGlobal true');
+  sGlobalOnly.updateGlobal({ ownedChickens: [1, 2, 7] });
+  const outGlobal = sGlobalOnly.exportBuffers();
+  eq(outGlobal.localSav, null, 'global-only export has null localSav');
+  ok(outGlobal.globalSav instanceof Uint8Array && outGlobal.globalSav.length > 0, 'global-only export globalSav valid');
+  const reloadGlobal = Core.createSession(Catalog).loadBuffers(outGlobal.globalSav, null);
+  deepEq(reloadGlobal.model.global.ownedChickens, [1, 2, 7], 'global-only mutation persisted');
+
+  // 3) swapped order (localSav, globalSav)
+  const sSwapped = Core.createSession(Catalog).loadBuffers(localSav, globalSav);
+  eq(sSwapped.getSummary().hasLocal, true, 'swapped hasLocal');
+  eq(sSwapped.getSummary().hasGlobal, true, 'swapped hasGlobal');
+  ok(sSwapped.listCharacters('', false).length >= 3, 'swapped decoded characters');
+
+  // 4) attachGlobalBuffer preserves pending local edits
+  const sAttach = Core.createSession(Catalog).loadBuffers(null, localSav);
+  sAttach.addCharacterFeature(1, 929);
+  sAttach.attachGlobalBuffer(globalSav);
+  eq(sAttach.getSummary().hasGlobal, true, 'attached global');
+  ok(sAttach.getCharacterDetail(1).featureIds.includes(929), 'local edit preserved after attachGlobalBuffer');
+
+  // 5) attachLocalBuffer preserves pending global edits
+  const sAttach2 = Core.createSession(Catalog).loadBuffers(globalSav, null);
+  sAttach2.updateGlobal({ ownedChickens: [9] });
+  sAttach2.attachLocalBuffer(localSav);
+  eq(sAttach2.getSummary().hasLocal, true, 'attached local');
+  deepEq(sAttach2.model.global.ownedChickens, [9], 'global edit preserved after attachLocalBuffer');
+});
+
+test('Catalog includes all 955 features (#0..#954) with pure Korean metadata', () => {
+  eq(Object.keys(Catalog.features).length, 955, '955 features in catalog');
+  ok(Catalog.featureMeta && Object.keys(Catalog.featureMeta).length === 955, '955 featureMeta entries');
+  eq(Catalog.features['0'], '공무유력', '#0 feature');
+  eq(Catalog.features['606'], '의사', '#606 org feature');
+  eq(Catalog.features['954'], '만귀유조', '#954 evil immortal feature');
+});
+
 console.log('\n────────────────────────────────────────');
 console.log('passed: ' + passed + ', failed: ' + failures.length);
 if (failures.length) {

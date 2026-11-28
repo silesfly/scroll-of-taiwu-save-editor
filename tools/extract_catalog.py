@@ -15,15 +15,112 @@ from pathlib import Path
 DEFAULT_SOURCE_DIR = Path("/home/jiyoung/workspace/무협위키/.local/graph/scroll-of-taiwu-data")
 OUTPUT_JS_PATH = Path("/home/jiyoung/workspace/editors/태오회권_에디터/src/catalog-data.js")
 
-HANZI_REGEX = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf]')
+HANZI_REGEX = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]')
 TAG_REGEX = re.compile(r'<[^>]+>')
+WS_REGEX = re.compile(r'\s+')
+
+EVIL_IMMORTAL_FEATURES = {
+    943: "겁심오화",
+    944: "구발역주",
+    945: "추천난법",
+    946: "건곤십변",
+    947: "봉원환소",
+    948: "마천파진",
+    949: "칠사둔법",
+    950: "삼신전반",
+    951: "명사서원",
+    952: "절생일념",
+    953: "망법단공",
+    954: "만귀유조",
+}
+EVIL_IMMORTAL_DESC = "현상 구탑 건립 후 출현한 사선의 특수 특성"
 
 def clean_text(text: str) -> str:
     if not text:
         return ""
     text = TAG_REGEX.sub('', text)
     text = HANZI_REGEX.sub('', text)
-    return text.strip()
+    text = text.replace('\\n', ' ').replace('\\r', ' ')
+    return WS_REGEX.sub(' ', text).strip()
+
+def parse_feature_language(file_path: Path) -> tuple[dict[int, str], dict[int, str], dict[int, str]]:
+    names: dict[int, str] = {}
+    descs: dict[int, str] = {}
+    effects: dict[int, str] = {}
+    if not file_path.exists():
+        return names, descs, effects
+    lines = file_path.read_text(encoding='utf-8', errors='ignore').splitlines()
+    i = 0
+    while i < len(lines) - 1:
+        key_line = lines[i].strip()
+        val_line = lines[i + 1].strip()
+        m = re.match(r'^(Name|Desc|EffectDesc|SmallVillageName|SmallVillageDesc)_(\d+)$', key_line)
+        if m:
+            prefix, idx_str = m.groups()
+            idx = int(idx_str)
+            cleaned = clean_text(val_line)
+            if cleaned:
+                if prefix == 'Name':
+                    names[idx] = cleaned
+                elif prefix == 'Desc':
+                    descs[idx] = cleaned
+                elif prefix == 'EffectDesc':
+                    effects[idx] = cleaned
+            i += 2
+        else:
+            i += 1
+    return names, descs, effects
+
+def build_feature_catalog(source_dir: Path, lang_ko_dir: Path) -> tuple[dict[str, str], dict[str, list]]:
+    names, descs, effects = parse_feature_language(lang_ko_dir / "CharacterFeature_language.txt")
+    for fid, name in EVIL_IMMORTAL_FEATURES.items():
+        names.setdefault(fid, name)
+        descs.setdefault(fid, EVIL_IMMORTAL_DESC)
+
+    dump_path = source_dir / "character_features_dump.json"
+    dump_rows: list[dict] = []
+    if dump_path.exists():
+        raw = json.loads(dump_path.read_text(encoding='utf-8-sig'))
+        if isinstance(raw, list):
+            dump_rows = raw
+
+    features: dict[str, str] = {}
+    feature_meta: dict[str, list] = {}
+    seen_ids: set[int] = set()
+
+    for row in dump_rows:
+        if not isinstance(row, dict) or "id" not in row:
+            continue
+        fid = int(row["id"])
+        seen_ids.add(fid)
+        key = str(fid)
+        name = names.get(fid) or f"특성 {fid}"
+        level = int(row.get("level", 0) or 0)
+        if row.get("basic"):
+            group_code = 0 if level >= 0 else 1
+        elif row.get("hidden"):
+            group_code = 3
+        elif row.get("chicken"):
+            group_code = 4
+        else:
+            group_code = 2
+        summary = effects.get(fid) or descs.get(fid) or ""
+        if len(summary) > 90:
+            summary = summary[:87].rstrip() + "..."
+        features[key] = name
+        feature_meta[key] = [group_code, level, summary]
+
+    for fid in sorted(names.keys()):
+        if fid in seen_ids:
+            continue
+        key = str(fid)
+        summary = effects.get(fid) or descs.get(fid) or ""
+        if len(summary) > 90:
+            summary = summary[:87].rstrip() + "..."
+        features[key] = names[fid]
+        feature_meta[key] = [2, 0, summary]
+
+    return features, feature_meta
 
 def parse_language_file(file_path: Path) -> dict:
     result = {}
@@ -136,9 +233,8 @@ def main():
                 "name": prof_lang[tid]
             })
 
-    # 3. Features
-    feat_lang = parse_language_file(lang_ko_dir / "CharacterFeature_language.txt")
-    features = {str(k): v for k, v in feat_lang.items()}
+    # 3. Features (955 total: basic + sect/quest/special + hidden/NPC + chicken DLC)
+    features, feature_meta = build_feature_catalog(source_dir, lang_ko_dir)
 
     # 4. CombatSkillTypes
     cst_lang = parse_language_file(lang_ko_dir / "CombatSkillType_language.txt")
@@ -218,6 +314,7 @@ def main():
         "organizations": organizations,
         "professions": professions,
         "features": features,
+        "featureMeta": feature_meta,
         "combatSkillTypes": combat_skill_types,
         "lifeSkillTypes": life_skill_types,
         "combatSkills": combat_skills,
